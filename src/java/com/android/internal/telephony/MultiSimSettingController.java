@@ -168,6 +168,8 @@ public class MultiSimSettingController extends Handler {
     private int mConvertedPsimSubId;
 
     private static final String SETTING_USER_PREF_DATA_SUB = "user_preferred_data_sub";
+    private static final String SETTING_USER_PREF_VOICE_SUB = "user_preferred_voice_sub";
+    private static final String SETTING_USER_PREF_SMS_SUB = "user_preferred_sms_sub";
 
     private static class DataSettingsControllerCallback extends DataSettingsManagerCallback {
         private final Phone mPhone;
@@ -631,13 +633,7 @@ public class MultiSimSettingController extends Handler {
 
         if (ArrayUtils.isEmpty(activeSubInfos)) {
             mPrimarySubList.clear();
-            if (DBG) log("updateDefaults: No active sub. Setting default to INVALID sub.");
-            mSubscriptionManagerService.setDefaultDataSubId(
-                    SubscriptionManager.INVALID_SUBSCRIPTION_ID);
-            mSubscriptionManagerService.setDefaultVoiceSubId(
-                    SubscriptionManager.INVALID_SUBSCRIPTION_ID);
-            mSubscriptionManagerService.setDefaultSmsSubId(
-                    SubscriptionManager.INVALID_SUBSCRIPTION_ID);
+            if (DBG) log("updateDefaults: No active sub.");
             return;
         }
 
@@ -652,11 +648,24 @@ public class MultiSimSettingController extends Handler {
         // set the primary to be default SIM and return.
         boolean conditionForOnePrimarySim = mPrimarySubList.size() == 1;
         if (conditionForOnePrimarySim) {
+            if (mActiveModemCount > 1 && mInitialHandling) {
+                log("updateDefaults: 1 primary sub while booting multi-SIM device, waiting for all subs");
+                return;
+            }
             int subId = mPrimarySubList.get(0);
             if (DBG) log("updateDefaultValues: to only primary sub " + subId);
-            if (hasData()) mSubscriptionManagerService.setDefaultDataSubId(subId);
-            if (hasCalling()) mSubscriptionManagerService.setDefaultVoiceSubId(subId);
-            if (hasMessaging()) mSubscriptionManagerService.setDefaultSmsSubId(subId);
+            if (hasData()) {
+                mSubscriptionManagerService.setDefaultDataSubId(subId);
+                setUserPrefDataSubIdInDB(subId);
+            }
+            if (hasCalling()) {
+                mSubscriptionManagerService.setDefaultVoiceSubId(subId);
+                setUserPrefVoiceSubIdInDB(subId);
+            }
+            if (hasMessaging()) {
+                mSubscriptionManagerService.setDefaultSmsSubId(subId);
+                setUserPrefSmsSubIdInDB(subId);
+            }
             if (!mSubscriptionManagerService.isEsimBootStrapProvisioningActivated()) {
                 // Determines the appropriate notification type
                 // Preconditions:
@@ -684,26 +693,52 @@ public class MultiSimSettingController extends Handler {
         if (hasData()) {
             // Update default data subscription.
             if (DBG) log("updateDefaultValues: Update default data subscription");
+            int oldDataSub = mSubscriptionManagerService.getDefaultDataSubId();
+            int userPrefData = getUserPrefDataSubIdFromDB();
             dataSelected = updateDefaultValue(mPrimarySubList,
-                    mSubscriptionManagerService.getDefaultDataSubId(),
-                    mSubscriptionManagerService::setDefaultDataSubId);
+                    oldDataSub,
+                    subId -> {
+                        mSubscriptionManagerService.setDefaultDataSubId(subId);
+                        setUserPrefDataSubIdInDB(subId);
+                    },
+                    true, userPrefData);
+            if (dataSelected) {
+                setUserPrefDataSubIdInDB(mSubscriptionManagerService.getDefaultDataSubId());
+            }
         }
 
         if (hasCalling()) {
             // Update default voice subscription.
             if (DBG) log("updateDefaultValues: Update default voice subscription");
+            int oldVoiceSub = mSubscriptionManagerService.getDefaultVoiceSubId();
+            int userPrefVoice = getUserPrefVoiceSubIdFromDB();
             voiceSelected = updateDefaultValue(mPrimarySubList,
-                    mSubscriptionManagerService.getDefaultVoiceSubId(),
-                    mSubscriptionManagerService::setDefaultVoiceSubId);
+                    oldVoiceSub,
+                    subId -> {
+                        mSubscriptionManagerService.setDefaultVoiceSubId(subId);
+                        setUserPrefVoiceSubIdInDB(subId);
+                    },
+                    true, userPrefVoice);
+            if (voiceSelected) {
+                setUserPrefVoiceSubIdInDB(mSubscriptionManagerService.getDefaultVoiceSubId());
+            }
         }
 
         if (hasMessaging()) {
             // Update default sms subscription.
             if (DBG) log("updateDefaultValues: Update default sms subscription");
+            int oldSmsSub = mSubscriptionManagerService.getDefaultSmsSubId();
+            int userPrefSms = getUserPrefSmsSubIdFromDB();
             smsSelected = updateDefaultValue(mPrimarySubList,
-                    mSubscriptionManagerService.getDefaultSmsSubId(),
-                    mSubscriptionManagerService::setDefaultSmsSubId,
-                    mIsAskEverytimeSupportedForSms);
+                    oldSmsSub,
+                    subId -> {
+                        mSubscriptionManagerService.setDefaultSmsSubId(subId);
+                        setUserPrefSmsSubIdInDB(subId);
+                    },
+                    mIsAskEverytimeSupportedForSms, userPrefSms);
+            if (smsSelected) {
+                setUserPrefSmsSubIdInDB(mSubscriptionManagerService.getDefaultSmsSubId());
+            }
         }
 
         boolean autoFallbackEnabled = mContext.getResources().getBoolean(
@@ -736,6 +771,10 @@ public class MultiSimSettingController extends Handler {
                 .collect(Collectors.toList());
 
         if (mInitialHandling) {
+            if (mActiveModemCount > 1 && mPrimarySubList.size() < mActiveModemCount) {
+                log("updatePrimarySubListAndGetChangeType: waiting for remaining SIMs on boot");
+                return PRIMARY_SUB_INITIALIZED;
+            }
             mInitialHandling = false;
             return PRIMARY_SUB_INITIALIZED;
         }
@@ -964,9 +1003,8 @@ public class MultiSimSettingController extends Handler {
         if (mPrimarySubList.size() == 1 && change == PRIMARY_SUB_REMOVED
                 && (!dataSelected || !smsSelected || !voiceSelected)) {
             dialogType = EXTRA_DEFAULT_SUBSCRIPTION_SELECT_TYPE_ALL;
-        } else if (mPrimarySubList.size() > 1 && (isUserVisibleChange(change)
-                || (change == PRIMARY_SUB_INITIALIZED && !dataSelected))) {
-            // If change is SWAPPED_IN_GROUP or MARKED_OPPT, don't ask user again.
+        } else if (mPrimarySubList.size() > 1 && !dataSelected) {
+            // Only ask user for default data if it is not selected or not valid among active subs
             dialogType = EXTRA_DEFAULT_SUBSCRIPTION_SELECT_TYPE_DATA;
         }
 
@@ -1096,11 +1134,17 @@ public class MultiSimSettingController extends Handler {
     // Returns whether the new default value is valid.
     private boolean updateDefaultValue(List<Integer> primarySubList, int oldValue,
             UpdateDefaultAction action) {
-        return updateDefaultValue(primarySubList, oldValue, action, true);
+        return updateDefaultValue(primarySubList, oldValue, action, true, INVALID_SUBSCRIPTION_ID);
     }
 
     private boolean updateDefaultValue(List<Integer> primarySubList, int oldValue,
             UpdateDefaultAction action, boolean allowInvalidSubId) {
+        return updateDefaultValue(primarySubList, oldValue, action, allowInvalidSubId,
+                INVALID_SUBSCRIPTION_ID);
+    }
+
+    private boolean updateDefaultValue(List<Integer> primarySubList, int oldValue,
+            UpdateDefaultAction action, boolean allowInvalidSubId, int userPrefSubId) {
         int newValue = INVALID_SUBSCRIPTION_ID;
 
         if (primarySubList.size() > 0) {
@@ -1109,18 +1153,29 @@ public class MultiSimSettingController extends Handler {
                 // 1) If the old subId is still active, or there's another active primary
                 // subscription that is in the same group, that should become the new default
                 // subscription.
-                // 2) If the old subId is INVALID_SUBSCRIPTION_ID and allowInvalidSubId is false,
-                // first active subscription is used for new default always.
-                if (areSubscriptionsInSameGroup(subId, oldValue)
-                        || (!allowInvalidSubId && oldValue == INVALID_SUBSCRIPTION_ID)) {
+                if (areSubscriptionsInSameGroup(subId, oldValue)) {
                     newValue = subId;
-                    log("[updateDefaultValue] updates to subId=" + newValue);
+                    log("[updateDefaultValue] keeps active subId=" + newValue);
                     break;
                 }
             }
+            // 2) If old subId was not found/invalid, but user had a preferred subId saved
+            // that is active, restore it.
+            if (!SubscriptionManager.isValidSubscriptionId(newValue)
+                    && SubscriptionManager.isValidSubscriptionId(userPrefSubId)
+                    && primarySubList.contains(userPrefSubId)) {
+                newValue = userPrefSubId;
+                log("[updateDefaultValue] restores user preferred subId=" + newValue);
+            }
+            // 3) If still invalid and allowInvalidSubId is false, first active sub is used.
+            if (!SubscriptionManager.isValidSubscriptionId(newValue)
+                    && !allowInvalidSubId && oldValue == INVALID_SUBSCRIPTION_ID) {
+                newValue = primarySubList.get(0);
+                log("[updateDefaultValue] fallback to first subId=" + newValue);
+            }
         }
 
-        if (oldValue != newValue) {
+        if (oldValue != newValue && SubscriptionManager.isValidSubscriptionId(newValue)) {
             if (DBG) log("[updateDefaultValue: subId] from " + oldValue + " to " + newValue);
             action.update(newValue);
         }
@@ -1183,36 +1238,59 @@ public class MultiSimSettingController extends Handler {
             return;
         }
         final int defaultDataSubId = mSubscriptionManagerService.getDefaultDataSubId();
-
-        if (DBG) {
-            log("updateUserPreferences:  dds = " + defaultDataSubId + " voice = "
-                    + mSubscriptionManagerService.getDefaultVoiceSubId()
-                    + " sms = " + mSubscriptionManagerService.getDefaultSmsSubId());
-        }
+        final int defaultVoiceSubId = mSubscriptionManagerService.getDefaultVoiceSubId();
+        final int defaultSmsSubId = mSubscriptionManagerService.getDefaultSmsSubId();
 
         int autoDefaultSubId = primarySubList.get(0);
 
-        if (hasMessaging() && (primarySubList.size() == 1) && !smsSelected) {
-            mSubscriptionManagerService.setDefaultSmsSubId(autoDefaultSubId);
-        }
-
-        if (hasCalling() && (primarySubList.size() == 1) && !voiceSelected) {
-            mSubscriptionManagerService.setDefaultVoiceSubId(autoDefaultSubId);
-        }
-
         int userPrefDataSubId = getUserPrefDataSubIdFromDB();
+        int userPrefVoiceSubId = getUserPrefVoiceSubIdFromDB();
+        int userPrefSmsSubId = getUserPrefSmsSubIdFromDB();
 
-        log("User pref subId = " + userPrefDataSubId + " current dds " + defaultDataSubId
-                + " next active subId " + autoDefaultSubId);
+        log("updateUserPreferences: userPrefData=" + userPrefDataSubId + " current dds="
+                + defaultDataSubId + " userPrefVoice=" + userPrefVoiceSubId
+                + " userPrefSms=" + userPrefSmsSubId);
 
         if (hasData()) {
-            // If earlier user selected DDS is now available, set that as DDS subId.
             if (primarySubList.contains(userPrefDataSubId)
-                    && SubscriptionManager.isValidSubscriptionId(userPrefDataSubId)
-                    && (defaultDataSubId != userPrefDataSubId)) {
-                mSubscriptionManagerService.setDefaultDataSubId(userPrefDataSubId);
+                    && SubscriptionManager.isValidSubscriptionId(userPrefDataSubId)) {
+                if (defaultDataSubId != userPrefDataSubId) {
+                    mSubscriptionManagerService.setDefaultDataSubId(userPrefDataSubId);
+                }
+            } else if (primarySubList.contains(defaultDataSubId)
+                    && SubscriptionManager.isValidSubscriptionId(defaultDataSubId)) {
+                setUserPrefDataSubIdInDB(defaultDataSubId);
             } else if (!dataSelected) {
                 mSubscriptionManagerService.setDefaultDataSubId(autoDefaultSubId);
+                setUserPrefDataSubIdInDB(autoDefaultSubId);
+            }
+        }
+
+        if (hasCalling()) {
+            if (primarySubList.contains(userPrefVoiceSubId)
+                    && SubscriptionManager.isValidSubscriptionId(userPrefVoiceSubId)) {
+                if (defaultVoiceSubId != userPrefVoiceSubId) {
+                    mSubscriptionManagerService.setDefaultVoiceSubId(userPrefVoiceSubId);
+                }
+            } else if (primarySubList.contains(defaultVoiceSubId)
+                    && SubscriptionManager.isValidSubscriptionId(defaultVoiceSubId)) {
+                setUserPrefVoiceSubIdInDB(defaultVoiceSubId);
+            } else if (primarySubList.size() == 1 && !voiceSelected) {
+                mSubscriptionManagerService.setDefaultVoiceSubId(autoDefaultSubId);
+            }
+        }
+
+        if (hasMessaging()) {
+            if (primarySubList.contains(userPrefSmsSubId)
+                    && SubscriptionManager.isValidSubscriptionId(userPrefSmsSubId)) {
+                if (defaultSmsSubId != userPrefSmsSubId) {
+                    mSubscriptionManagerService.setDefaultSmsSubId(userPrefSmsSubId);
+                }
+            } else if (primarySubList.contains(defaultSmsSubId)
+                    && SubscriptionManager.isValidSubscriptionId(defaultSmsSubId)) {
+                setUserPrefSmsSubIdInDB(defaultSmsSubId);
+            } else if (primarySubList.size() == 1 && !smsSelected) {
+                mSubscriptionManagerService.setDefaultSmsSubId(autoDefaultSubId);
             }
         }
 
@@ -1227,6 +1305,31 @@ public class MultiSimSettingController extends Handler {
     private int getUserPrefDataSubIdFromDB() {
         return android.provider.Settings.Global.getInt(mContext.getContentResolver(),
                 SETTING_USER_PREF_DATA_SUB, SubscriptionManager.INVALID_SUBSCRIPTION_ID);
+    }
+
+    private void setUserPrefDataSubIdInDB(int subId) {
+        android.provider.Settings.Global.putInt(mContext.getContentResolver(),
+                SETTING_USER_PREF_DATA_SUB, subId);
+    }
+
+    private int getUserPrefVoiceSubIdFromDB() {
+        return android.provider.Settings.Global.getInt(mContext.getContentResolver(),
+                SETTING_USER_PREF_VOICE_SUB, SubscriptionManager.INVALID_SUBSCRIPTION_ID);
+    }
+
+    private void setUserPrefVoiceSubIdInDB(int subId) {
+        android.provider.Settings.Global.putInt(mContext.getContentResolver(),
+                SETTING_USER_PREF_VOICE_SUB, subId);
+    }
+
+    private int getUserPrefSmsSubIdFromDB() {
+        return android.provider.Settings.Global.getInt(mContext.getContentResolver(),
+                SETTING_USER_PREF_SMS_SUB, SubscriptionManager.INVALID_SUBSCRIPTION_ID);
+    }
+
+    private void setUserPrefSmsSubIdInDB(int subId) {
+        android.provider.Settings.Global.putInt(mContext.getContentResolver(),
+                SETTING_USER_PREF_SMS_SUB, subId);
     }
 
     private boolean isRadioAvailableOnAllSubs() {
